@@ -1,79 +1,65 @@
-# Livrable TP3 - Cluster Cassandra : réplication et tolérance aux pannes
+# Compte-rendu TP3 - Cluster Cassandra : réplication et tolérance aux pannes
 
-## Q1 - Après démarrage des 3 nœuds
+## 1) Architecture du cluster
 
-- Nœuds présents : 3 (cass1, cass2, cass3)
-- États : cass1 UN, cass2 UN, cass3 DN (Down/Normal) au moment de la vérification (puis UN après redémarrage)
+- Cluster : tp2-cluster
 - Datacenter : dc1
-- Racks : cass1→rack1, cass2→rack2, cass3→rack3
+- Racks : rack1 (cass1), rack2 (cass2), rack3 (cass3)
+- Nœuds : 3 (cass1,cass2,cass3). Après mise en route complète : UN/UN/UN.
 
-Vérif : `nodetool status` → 3 nœuds dans dc1, répartis sur 3 racks distincts.
+## 2) Table métier du TP2
 
-## Q2 - Architecture
-
-Cluster : tp2-cluster (ensemble logique des nœuds Cassandra).  
-Datacenter (dc1) : groupe logique de nœuds (tolérance aux pannes/failover par DC).  
-Rack : sous-groupe dans un DC (contrôle placement réplication/anti-affinity).  
-Node : instance Cassandra (cass1/cass2/cass3).
-
-Architecture obtenue : cluster tp2-cluster, dc1, racks rack1/rack2/rack3, 3 nœuds opérationnels (UN) après redémarrage complet.
-
-## Q3 - Table métier (TP2 réutilisée)
-
-- Keyspace : velib_cluster
+- Keyspace : velib_cluster (NetworkTopologyStrategy, dc1:3)
 - Table : stations_velib
-- Colonnes principales : station_id (text), nom_station (text), capacite (int), vatiques_disponibles (int), bornes_disponibles (int), derniere_mise_a_jour (timestamp)
-- Partition key : station_id (PRIMARY KEY = (station_id))
+- Colonnes : station_id (text), nom_station (text), capacite (int), vatiques_disponibles (int), bornes_disponibles (int), derniere_mise_a_jour (timestamp)
+- Partition key : station_id
 - Clustering key : aucune
+- Données : 1240 lignes
 
-Données : 1519 récupérées, 1240 lignes présentes (upsert sur PK).
+## 3) Replication Factor (RF)
 
-## Q4 - RF = 3
+RF = 3 (dc1) : chaque partition répliquée sur 3 nœuds distincts du DC.
+- Partitionnement = PK → hash/token → nœud responsable
+- Réplication = copies sur autres nœuds (tolérance aux pannes)
 
-RF = 3 signifie : pour chaque partition de la table, Cassandra réplique les données sur **3 nœuds distincts** dans le datacenter dc1.
+Chemin : PK → Murmur3 → token → nœud responsable + réplicas (NetworkTopologyStrategy dc1:3).
 
-Diff :  
-- Partitionnement = distribue les partitions (PK → hash → token) sur les nœuds responsables (placement).  
-- Réplication = crée des **copies** (réplicas) de chaque partition sur d'autres nœuds pour tolérance aux pannes.
+## 4) Tests de cohérence : ONE / QUORUM / ALL
 
-## Q5 - Chemin d'une donnée
+Station : station_id='3004' (RF=3)
 
-PK → hash (Murmur3Partitioner) → token → nœud(s) responsable(s) (coordinator/token range owner) → réplicas déterminés par NetworkTopologyStrategy(dc1:3) (choisis sur différents nœuds/racks selon stratégie) pour assurer redondance.
-
-## Q6 - Niveaux de cohérence (RF=3)
-
-Lecture sur station_id='3004' :
-
-| Niveau | Réplicas requis (RF=3) | Résultat (3 nœuds UN) | Garantie | Dispo |
+| CL | Requis | 3 nœuds UN | Garantie | Dispo |
 |---|---:|---|---|---|
-| ONE | 1 | OK | Lecture depuis au moins 1 réplica (peut être ancienne si réparation différée) | Max |
-| QUORUM | 2 (floor(3/2)+1) | OK | Lecture cohérente entre majorité (2) → équilibre | Moyenne |
-| ALL | 3 | OK | Lecture depuis **tous** les réplicas → cohérence forte | Min (sensible aux pannes) |
+| ONE | 1 | OK | ≥1 réplica | Max |
+| QUORUM | 2 | OK | majorité (2) | Moyenne |
+| ALL | 3 | OK | tous les réplicas | Min |
 
-## Q7 - Panne de cass3
+## 5) Simulation de panne
 
-Après `docker stop cass3` :  
-- cass3 → DN (Down/Normal), Unreachable  
-- cass1 → UN, cass2 → UN  
-- Nœuds disponibles : **2** sur 3
+`docker stop cass3` → cass1 UN, cass2 UN, cass3 DN (Unreachable). Nœuds disponibles : 2/3.
 
-## Q8 - Lectures pendant la panne
+## 6) Résultats pendant la panne
 
-Même station ('3004'), RF=3, 2 nœuds dispo :
-
-| Niveau | Requis | Résultat | Explication |
+| CL | Requis | Résultat | Observations |
 |---|---:|---|---|
-| ONE | 1 | OK | Suffisant (≥1 réplica vivante atteignable) |
-| QUORUM | 2 | OK | 2 nœuds UN disponibles → quorum atteint (majorité des réplicas requis atteinte) |
-| ALL | 3 | **Échec (NoHostAvailable / Cannot achieve consistency level ALL)** | Nécessite 3 réplicas vivants, seulement 2 dispo → impossible d'atteindre ALL
+| ONE | 1 | OK | fonctionne |
+| QUORUM | 2 | OK | quorum atteint (2/3) |
+| ALL | 3 | ÉCHEC (NoHostAvailable / Cannot achieve consistency level ALL) | impossible (2 dispo < 3) |
 
-Lien : **réplicas requis (CL) + nœuds vivants (disponibles)**. Avec RF=3, QUORUM=2 tolère 1 panne (reste ≥2), ALL tolère 0. ONE tolère 2.
+## 7) Redémarrage de cass3
 
-## Q9 - Redémarrage de cass3
+`docker start cass3` → ~60s, cass3 UN. Réintégration automatique (join/streaming). Cluster 3 UN.
 
-Après `docker start cass3` + ~60s : cass3 repasse à **UN (Up/Normal)**. Les 3 nœuds sont à nouveau opérationnels (dc1 complet). Cassandra le réintègre au cluster (join/streaming) automatiquement.
+## 8) Vérification finale des données
 
-## Q10 - Après redémarrage
+Lectures OK y compris ALL. Données accessibles. Réplicas se rééquilibrent au retour.
 
-Lectures à nouveau possibles à **ALL** (retour OK).  
-Scénario : données répliquées sur 3 nœuds (RF=3). Panne de cass3 → 2 dispo (lecture toujours accessible selon CL). Retour de cass3 → réintégration + réplication/équilibrage (données déjà présentes sur réplicas vivants, streaming/hints selon besoin) → cluster stable, données accessibles à tous les CL testés.
+## 9) Observations et conclusions
+
+Observations : avec RF=3, panne partielle tolérée selon CL. QUORUM garde disponibilité avec 1 panne ; ALL strict. Retour auto.
+
+Conclusion : réplication + cohérence choisie selon besoin dispo/cohérence. RF=3 permet continuité (ONE/QUORUM) malgré cass3 down.
+
+## 10) Q11 - Pourquoi la réplication permet la continuité ?
+
+Chaque partition existe sur 3 nœuds. Si 1 tombe, d'autres réplicas restent disponibles. Selon CL requis, quorum peut être atteint → requêtes réussissent. Au retour, streaming/hints resynchronisent cass3.
